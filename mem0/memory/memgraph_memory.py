@@ -1,4 +1,5 @@
 import logging
+import json 
 
 from mem0.memory.utils import format_entities, sanitize_relationship_for_cypher
 
@@ -202,13 +203,44 @@ class MemoryGraph:
         _tools = [EXTRACT_ENTITIES_TOOL]
         if self.llm_provider in ["azure_openai_structured", "openai_structured"]:
             _tools = [EXTRACT_ENTITIES_STRUCT_TOOL]
+        
+        prompt = f"""You are a smart assistant focused on extracting entities and their types from user input.
+                        Your primary goal is to identify and list all relevant entities present in the text.
+
+                        **Entity Definitions:**
+                        *   **Core Entities:** These are specific, identifiable things like people, places, organizations, products, dates, times, etc.
+                        *   **Self-Reference Entity:** If the user message contains first-person pronouns such as 'I', 'me', 'my', 'mine', or 'myself', you **MUST** treat the provided `user_id` as a specific entity. The entity name will be the `user_id` itself, and its `entity_type` will be 'user'.
+                        *   **Other Entities:** Identify other common entities like locations, organizations, products, dates, etc., and assign an appropriate `entity_type`.
+
+                        **Important Rules:**
+                        1.  **NEVER answer the user's question directly.** Your sole purpose is to extract entities.
+                        2.  **Always map first-person pronouns to `user_id`**. This is a mandatory entity extraction.
+                        3.  If an entity is ambiguous or its type cannot be determined, **do not include it** in the output.
+
+                        ---
+
+                        **Examples:**
+
+                        **Example 1: Simple Query with Self-Reference**
+                        **Input Data:** "Where can I find good supermarkets?"
+                        **User ID:** "test_user_memory_manager_optimized"
+
+                        **Expected Output (Tool Call):**
+                        ```json
+                        {{
+                        "entities": [
+                            {{"entity": "test_user_memory_manager_optimized", "entity_type": "user"}},
+                            {{"entity": "supermarkets", "entity_type": "place_type"}}
+                        ]
+                        }}
+                        ```"""
         search_results = self.llm.generate_response(
             messages=[
                 {
                     "role": "system",
-                    "content": f"You are a smart assistant who understands entities and their types in a given text. If user message contains self reference such as 'I', 'me', 'my' etc. then use {filters['user_id']} as the source entity. Extract all the entities from the text. ***DO NOT*** answer the question itself if the given text is a question.",
+                    "content": prompt,
                 },
-                {"role": "user", "content": data},
+                {"role": "user", "content": json.dumps({"user_id": filters["user_id"], "data": data})},
             ],
             tools=_tools,
         )
@@ -281,23 +313,17 @@ class MemoryGraph:
             # Build query based on whether agent_id is provided
             if filters.get("agent_id"):
                 cypher_query = """
-                MATCH (n:Entity {user_id: $user_id, agent_id: $agent_id})
-                WHERE n.embedding IS NOT NULL
-                WITH n, $n_embedding as n_embedding
-                CALL node_similarity.cosine_pairwise("embedding", [n_embedding], [n.embedding])
-                YIELD node1, node2, similarity
-                WITH n, similarity
-                WHERE similarity >= $threshold
+                CALL vector_search.search("memzero", $limit, $n_embedding)
+                YIELD distance, node, similarity
+                WITH node AS n, similarity
+                WHERE n:Entity AND n.user_id = $user_id AND n.agent_id = $agent_id AND n.embedding IS NOT NULL AND similarity >= $threshold
                 MATCH (n)-[r]->(m:Entity)
                 RETURN n.name AS source, id(n) AS source_id, type(r) AS relationship, id(r) AS relation_id, m.name AS destination, id(m) AS destination_id, similarity
                 UNION
-                MATCH (n:Entity {user_id: $user_id, agent_id: $agent_id})
-                WHERE n.embedding IS NOT NULL
-                WITH n, $n_embedding as n_embedding
-                CALL node_similarity.cosine_pairwise("embedding", [n_embedding], [n.embedding])
-                YIELD node1, node2, similarity
-                WITH n, similarity
-                WHERE similarity >= $threshold
+                CALL vector_search.search("memzero", $limit, $n_embedding)
+                YIELD distance, node, similarity
+                WITH node AS n, similarity
+                WHERE n:Entity AND n.user_id = $user_id AND n.agent_id = $agent_id AND n.embedding IS NOT NULL AND similarity >= $threshold
                 MATCH (m:Entity)-[r]->(n)
                 RETURN m.name AS source, id(m) AS source_id, type(r) AS relationship, id(r) AS relation_id, n.name AS destination, id(n) AS destination_id, similarity
                 ORDER BY similarity DESC
@@ -312,23 +338,17 @@ class MemoryGraph:
                 }
             else:
                 cypher_query = """
-                MATCH (n:Entity {user_id: $user_id})
-                WHERE n.embedding IS NOT NULL
-                WITH n, $n_embedding as n_embedding
-                CALL node_similarity.cosine_pairwise("embedding", [n_embedding], [n.embedding])
-                YIELD node1, node2, similarity
-                WITH n, similarity
-                WHERE similarity >= $threshold
+                CALL vector_search.search("memzero", $limit, $n_embedding)
+                YIELD distance, node, similarity
+                WITH node AS n, similarity
+                WHERE n:Entity AND n.user_id = $user_id AND n.embedding IS NOT NULL AND similarity >= $threshold
                 MATCH (n)-[r]->(m:Entity)
                 RETURN n.name AS source, id(n) AS source_id, type(r) AS relationship, id(r) AS relation_id, m.name AS destination, id(m) AS destination_id, similarity
                 UNION
-                MATCH (n:Entity {user_id: $user_id})
-                WHERE n.embedding IS NOT NULL
-                WITH n, $n_embedding as n_embedding
-                CALL node_similarity.cosine_pairwise("embedding", [n_embedding], [n.embedding])
-                YIELD node1, node2, similarity
-                WITH n, similarity
-                WHERE similarity >= $threshold
+                CALL vector_search.search("memzero", $limit, $n_embedding)
+                YIELD distance, node, similarity
+                WITH node AS n, similarity
+                WHERE n:Entity AND n.user_id = $user_id AND n.embedding IS NOT NULL AND similarity >= $threshold
                 MATCH (m:Entity)-[r]->(n)
                 RETURN m.name AS source, id(m) AS source_id, type(r) AS relationship, id(r) AS relation_id, n.name AS destination, id(n) AS destination_id, similarity
                 ORDER BY similarity DESC
