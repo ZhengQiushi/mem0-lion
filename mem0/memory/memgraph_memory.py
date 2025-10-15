@@ -1,5 +1,5 @@
 import logging
-import json 
+import json
 
 from mem0.memory.utils import format_entities, sanitize_relationship_for_cypher
 
@@ -11,7 +11,9 @@ except ImportError:
 try:
     from rank_bm25 import BM25Okapi
 except ImportError:
-    raise ImportError("rank_bm25 is not installed. Please install it using pip install rank-bm25")
+    # BM25 is no longer needed in the search method as per new requirements.
+    # Keeping the import block for now, but its usage will be removed.
+    pass 
 
 from mem0.graphs.tools import (
     DELETE_MEMORY_STRUCT_TOOL_GRAPH,
@@ -21,11 +23,20 @@ from mem0.graphs.tools import (
     RELATIONS_STRUCT_TOOL,
     RELATIONS_TOOL,
 )
+from mem0.graphs.category_tools import (
+    EXTRACT_CATEGORIES_TOOL,
+    EXTRACT_CATEGORIES_STRUCT_TOOL,
+    CLASSIFY_QUERY_CATEGORIES_TOOL,
+    CLASSIFY_QUERY_CATEGORIES_STRUCT_TOOL,
+    get_category_extraction_prompt,
+    get_category_extraction_kwargs,
+    pack_category_input,
+)
+from mem0.graphs.extract_category import get_default_profiles
 from mem0.graphs.utils import EXTRACT_RELATIONS_PROMPT, get_delete_messages
 from mem0.utils.factory import EmbedderFactory, LlmFactory
 
 logger = logging.getLogger(__name__)
-
 
 class MemoryGraph:
     def __init__(self, config):
@@ -63,22 +74,40 @@ class MemoryGraph:
         # 2. Create label property index for performance optimizations
         embedding_dims = self.config.embedder.config["embedding_dims"]
         index_info = self._fetch_existing_indexes()
-        # Create vector index if not exists
+        # Create vector index if not exists for memzero
         if not any(idx.get("index_name") == "memzero" for idx in index_info["vector_index_exists"]):
             self.graph.query(
                 f"CREATE VECTOR INDEX memzero ON :Entity(embedding) WITH CONFIG {{'dimension': {embedding_dims}, 'capacity': 1000, 'metric': 'cos'}};"
             )
-        # Create label+property index if not exists
+        # --- NEW: Create vector index if not exists for memzero_category ---
+        if not any(idx.get("index_name") == "memzero_category" for idx in index_info["vector_index_exists"]):
+            self.graph.query(
+                f"CREATE VECTOR INDEX memzero_category ON :Category(embedding) WITH CONFIG {{'dimension': {embedding_dims}, 'capacity': 1000, 'metric': 'cos'}};"
+            )
+
+        # Create label+property index if not exists for Entity
         if not any(
-            idx.get("index type") == "label+property" and idx.get("label") == "Entity"
+            idx.get("index type") == "label+property" and idx.get("label") == "Entity" and idx.get("properties") == "user_id"
             for idx in index_info["index_exists"]
         ):
             self.graph.query("CREATE INDEX ON :Entity(user_id);")
-        # Create label index if not exists
+        # Create label index if not exists for Entity
         if not any(
             idx.get("index type") == "label" and idx.get("label") == "Entity" for idx in index_info["index_exists"]
         ):
             self.graph.query("CREATE INDEX ON :Entity;")
+        
+        # --- NEW: Create label+property index if not exists for Category ---
+        if not any(
+            idx.get("index type") == "label+property" and idx.get("label") == "Category" and idx.get("properties") == "user_id"
+            for idx in index_info["index_exists"]
+        ):
+            self.graph.query("CREATE INDEX ON :Category(user_id);")
+        # --- NEW: Create label index if not exists for Category ---
+        if not any(
+            idx.get("index type") == "label" and idx.get("label") == "Category" for idx in index_info["index_exists"]
+        ):
+            self.graph.query("CREATE INDEX ON :Category;")
 
     def add(self, data, filters):
         """
@@ -88,21 +117,39 @@ class MemoryGraph:
             data (str): The data to add to the graph.
             filters (dict): A dictionary containing filters to be applied during the addition.
         """
+        # Extract entities for entity subgraph
         entity_type_map = self._retrieve_nodes_from_data(data, filters)
         to_be_added = self._establish_nodes_relations_from_data(data, filters, entity_type_map)
         search_output = self._search_graph_db(node_list=list(entity_type_map.keys()), filters=filters)
         to_be_deleted = self._get_delete_entities_from_search_output(search_output, data, filters)
 
+        # Extract categories for category subgraph
+        categories = self._extract_categories_from_data(data, filters)
+        
         # TODO: Batch queries with APOC plugin
         # TODO: Add more filter support
         deleted_entities = self._delete_entities(to_be_deleted, filters)
         added_entities = self._add_entities(to_be_added, filters, entity_type_map)
+        
+        # Add categories to category subgraph
+        try:
+            added_categories = self._add_categories(categories, filters)
+            logger.info(f"Successfully added {len(added_categories)} categories to subgraph")
+        except Exception as e:
+            logger.error(f"Error adding categories to subgraph: {e}")
+            import traceback
+            traceback.print_exc()
+            added_categories = []
 
-        return {"deleted_entities": deleted_entities, "added_entities": added_entities}
+        return {
+            "deleted_entities": deleted_entities, 
+            "added_entities": added_entities,
+            "added_categories": added_categories
+        }
 
     def search(self, query, filters, limit=100):
         """
-        Search for memories and related graph data.
+        Search for memories and related graph data using dual-path retrieval.
 
         Args:
             query (str): Query to search for.
@@ -111,46 +158,50 @@ class MemoryGraph:
 
         Returns:
             dict: A dictionary containing:
-                - "contexts": List of search results from the base data store.
-                - "entities": List of related graph data based on the query.
+                - "entity_results": List of results from entity subgraph search.
+                - "category_results": List of results from category subgraph search.
         """
-        entity_type_map = self._retrieve_nodes_from_data(query, filters)
-        search_output = self._search_graph_db(node_list=list(entity_type_map.keys()), filters=filters)
-
-        if not search_output:
-            return []
-
-        search_outputs_sequence = [
-            [item["source"], item["relationship"], item["destination"]] for item in search_output
-        ]
-        bm25 = BM25Okapi(search_outputs_sequence)
-
-        tokenized_query = query.split(" ")
-        reranked_results = bm25.get_top_n(tokenized_query, search_outputs_sequence, n=5)
-
-        search_results = []
-        for item in reranked_results:
-            search_results.append({"source": item[0], "relationship": item[1], "destination": item[2]})
-
-        logger.info(f"Returned {len(search_results)} search results")
-
-        return search_results
+        # Path 1: Category-aware retrieval (context-aware)
+        category_results = self._search_category_subgraph(query, filters, limit)
+        
+        # Path 2: Traditional entity retrieval (embedding-based)
+        entity_results = self._search_entity_subgraph(query, filters, limit)
+        
+        return {
+            "entity_results": entity_results,
+            "category_results": category_results
+        }
 
     def delete_all(self, filters):
         """Delete all nodes and relationships for a user or specific agent."""
         if filters.get("agent_id"):
-            cypher = """
+            # Delete from memzero
+            cypher_memzero = """
             MATCH (n:Entity {user_id: $user_id, agent_id: $agent_id})
             DETACH DELETE n
             """
+            # --- NEW: Delete from memzero_category (Category nodes) ---
+            cypher_category = """
+            MATCH (n:Category {user_id: $user_id, agent_id: $agent_id})
+            DETACH DELETE n
+            """
             params = {"user_id": filters["user_id"], "agent_id": filters["agent_id"]}
+            self.graph.query(cypher_memzero, params=params)
+            self.graph.query(cypher_category, params=params) # Execute category deletion
         else:
-            cypher = """
+            # Delete from memzero
+            cypher_memzero = """
             MATCH (n:Entity {user_id: $user_id})
             DETACH DELETE n
             """
+            # --- NEW: Delete from memzero_category (Category nodes) ---
+            cypher_category = """
+            MATCH (n:Category {user_id: $user_id})
+            DETACH DELETE n
+            """
             params = {"user_id": filters["user_id"]}
-        self.graph.query(cypher, params=params)
+            self.graph.query(cypher_memzero, params=params)
+            self.graph.query(cypher_category, params=params) # Execute category deletion
 
     def get_all(self, filters, limit=100):
         """
@@ -167,6 +218,7 @@ class MemoryGraph:
                 - 'target': The target node name.
         """
         # Build query based on whether agent_id is provided
+        # This function should only query the main memzero graph for the complete picture
         if filters.get("agent_id"):
             query = """
             MATCH (n:Entity {user_id: $user_id, agent_id: $agent_id})-[r]->(m:Entity {user_id: $user_id, agent_id: $agent_id})
@@ -304,7 +356,8 @@ class MemoryGraph:
         return entities
 
     def _search_graph_db(self, node_list, filters, limit=100):
-        """Search similar nodes among and their respective incoming and outgoing relations."""
+        """Search similar nodes among and their respective incoming and outgoing relations in memzero."""
+        # 此函数用于`add`方法中查找主memzero图中的现有相似节点，不应为新的搜索逻辑修改。
         result_relations = []
 
         for node in node_list:
@@ -416,7 +469,7 @@ class MemoryGraph:
                 agent_filter = "AND n.agent_id = $agent_id AND m.agent_id = $agent_id"
                 params["agent_id"] = agent_id
 
-            # Delete the specific relationship between nodes
+            # Delete the specific relationship between nodes in memzero
             cypher = f"""
             MATCH (n:Entity {{name: $source_name, user_id: $user_id}})
             -[r:{relationship}]->
@@ -431,6 +484,7 @@ class MemoryGraph:
 
             result = self.graph.query(cypher, params=params)
             results.append(result)
+
 
         return results
 
@@ -557,6 +611,15 @@ class MemoryGraph:
 
             result = self.graph.query(cypher, params=params)
             results.append(result)
+
+            # --- NEW: 同步更新memzero_category ---
+            # 如果源是用户，且目标是非用户实体（一级类目）
+            if source == user_id and destination_type != "user":
+                self._add_to_memzero_category(user_id, agent_id, destination, dest_embedding)
+            # 如果目标是用户，且源是非用户实体（一级类目）
+            elif destination == user_id and source_type != "user":
+                self._add_to_memzero_category(user_id, agent_id, source, source_embedding)
+
         return results
 
     def _remove_spaces_from_entities(self, entity_list):
@@ -656,3 +719,318 @@ class MemoryGraph:
         index_exists = list(self.graph.query("SHOW INDEX INFO;"))
         vector_index_exists = list(self.graph.query("SHOW VECTOR INDEX INFO;"))
         return {"index_exists": index_exists, "vector_index_exists": vector_index_exists}
+
+    # --- NEW HELPER METHODS FOR CATEGORY SUBGRAPH ---
+
+    def _extract_categories_from_data(self, data, filters):
+        """Extract categories from user data using LLM."""
+        _tools = [EXTRACT_CATEGORIES_TOOL]
+        if self.llm_provider in ["azure_openai_structured", "openai_structured"]:
+            _tools = [EXTRACT_CATEGORIES_STRUCT_TOOL]
+        
+        # Get existing user categories for context
+        existing_categories = self._get_existing_user_categories(filters)
+        
+        # Prepare input for category extraction
+        memo_input = pack_category_input(existing_categories, data)
+        
+        # Get category extraction prompt
+        topic_examples = get_default_profiles()
+        prompt = get_category_extraction_prompt(topic_examples)
+        
+        search_results = self.llm.generate_response(
+            messages=[
+                {"role": "system", "content": prompt},
+                {"role": "user", "content": memo_input},
+            ],
+            tools=_tools,
+        )
+
+        categories = []
+        try:
+            for tool_call in search_results["tool_calls"]:
+                if tool_call["name"] != "extract_categories":
+                    continue
+                for item in tool_call["arguments"]["categories"]:
+                    categories.append({
+                        "topic": item["topic"],
+                        "sub_topic": item["sub_topic"], 
+                        "memo": item["memo"]
+                    })
+        except Exception as e:
+            logger.exception(f"Error in category extraction: {e}")
+            
+        logger.debug(f"Extracted categories: {categories}")
+        return categories
+
+    def _add_categories(self, categories, filters):
+        """Add categories to the category subgraph."""
+        user_id = filters["user_id"]
+        agent_id = filters.get("agent_id")
+        results = []
+        
+        for category in categories:
+            topic = category["topic"]
+            sub_topic = category["sub_topic"]
+            memo = category["memo"]
+            
+            # Create embeddings for each level
+            topic_embedding = self.embedding_model.embed(topic)
+            sub_topic_embedding = self.embedding_model.embed(sub_topic)
+            memo_embedding = self.embedding_model.embed(memo)
+            
+            # Build category hierarchy: user -> topic -> sub_topic -> memo
+            result = self._add_category_hierarchy(
+                user_id, agent_id, topic, sub_topic, memo,
+                topic_embedding, sub_topic_embedding, memo_embedding
+            )
+            results.append(result)
+            
+        return results
+
+    def _add_category_hierarchy(self, user_id, agent_id, topic, sub_topic, memo, 
+                               topic_embedding, sub_topic_embedding, memo_embedding):
+        """Add the complete category hierarchy to the graph."""
+        agent_id_clause = ""
+        if agent_id:
+            agent_id_clause = ", agent_id: $agent_id"
+            
+        cypher = f"""
+        // Ensure user node exists
+        MERGE (user:Entity {{name: $user_id, user_id: $user_id{agent_id_clause}}})
+        ON CREATE SET user.created = timestamp()
+        
+        // Create topic node
+        MERGE (topic:Category:Entity {{name: $topic, user_id: $user_id{agent_id_clause}}})
+        ON CREATE SET topic.created = timestamp(), topic.embedding = $topic_embedding
+        ON MATCH SET topic.embedding = $topic_embedding
+        
+        // Create sub_topic node  
+        MERGE (sub_topic:Category:Entity {{name: $sub_topic, user_id: $user_id{agent_id_clause}}})
+        ON CREATE SET sub_topic.created = timestamp(), sub_topic.embedding = $sub_topic_embedding
+        ON MATCH SET sub_topic.embedding = $sub_topic_embedding
+        
+        // Create memo node
+        MERGE (memo:Category:Entity {{name: $memo, user_id: $user_id{agent_id_clause}}})
+        ON CREATE SET memo.created = timestamp(), memo.embedding = $memo_embedding
+        ON MATCH SET memo.embedding = $memo_embedding
+        
+        // Create relationships: user -> topic -> sub_topic -> memo
+        MERGE (user)-[r1:HAS_TOPIC]->(topic)
+        ON CREATE SET r1.created = timestamp()
+        
+        MERGE (topic)-[r2:HAS_SUB_TOPIC]->(sub_topic)
+        ON CREATE SET r2.created = timestamp()
+        
+        MERGE (sub_topic)-[r3:HAS_MEMO]->(memo)
+        ON CREATE SET r3.created = timestamp()
+        
+        RETURN user.name AS user, topic.name AS topic, sub_topic.name AS sub_topic, memo.name AS memo
+        """
+        
+        params = {
+            "user_id": user_id,
+            "topic": topic,
+            "sub_topic": sub_topic,
+            "memo": memo,
+            "topic_embedding": topic_embedding,
+            "sub_topic_embedding": sub_topic_embedding,
+            "memo_embedding": memo_embedding,
+        }
+        if agent_id:
+            params["agent_id"] = agent_id
+            
+        result = self.graph.query(cypher, params=params)
+        logger.debug(f"Added category hierarchy: {user_id} -> {topic} -> {sub_topic} -> {memo}")
+        return result
+
+    def _search_category_subgraph(self, query, filters, limit=100):
+        """Search the category subgraph using context-aware retrieval."""
+        # First, classify the query to identify relevant categories
+        query_categories = self._classify_query_categories(query, filters)
+        
+        if not query_categories:
+            logger.info("No relevant categories identified for query")
+            return []
+            
+        # Search for matching categories in the subgraph
+        results = []
+        user_id = filters["user_id"]
+        agent_id = filters.get("agent_id")
+        
+        for category in query_categories:
+            topic = category["topic"]
+            sub_topic = category["sub_topic"]
+            confidence = category["confidence"]
+            
+            if confidence < 0.3:  # Skip low confidence categories
+                continue
+                
+            # Search for matching category paths
+            category_results = self._search_category_paths(user_id, agent_id, topic, sub_topic, limit)
+            results.extend(category_results)
+            
+        return results[:limit]
+
+    def _search_entity_subgraph(self, query, filters, limit=100):
+        """Search the entity subgraph using traditional embedding-based retrieval."""
+        entity_type_map = self._retrieve_nodes_from_data(query, filters)
+        search_output = self._search_graph_db(node_list=list(entity_type_map.keys()), filters=filters)
+        
+        if not search_output:
+            return []
+            
+        # Format results for consistency
+        results = []
+        for item in search_output:
+            results.append({
+                "source": item["source"],
+                "relationship": item["relationship"], 
+                "destination": item["destination"]
+            })
+            
+        return results[:limit]
+
+    def _classify_query_categories(self, query, filters):
+        """Classify query to identify relevant categories."""
+        _tools = [CLASSIFY_QUERY_CATEGORIES_TOOL]
+        if self.llm_provider in ["azure_openai_structured", "openai_structured"]:
+            _tools = [CLASSIFY_QUERY_CATEGORIES_STRUCT_TOOL]
+            
+        prompt = """You are a smart assistant that classifies user queries to identify which user profile categories might be relevant for context-aware retrieval.
+
+Use these exact category names that match the stored data:
+- basic_info: name, age, gender, location, contact
+- work: title, company, industry, skills, experience  
+- education: degree, school, field, graduation_year
+- interests: hobbies, sports, music, movies, books, travel
+- health: conditions, medications, allergies, fitness
+- family: spouse, children, parents, siblings
+- social: friends, social_media, groups, activities
+
+For example:
+- "Tell me some swimming clubs near" -> might be relevant to "basic_info" with "location" subcategory and "interests" with "hobbies" subcategory
+- "What movies do I like?" -> relevant to "interests" category with "movies" subcategory
+- "Where do I work?" -> relevant to "work" category
+- "How old is Tom?" -> relevant to "basic_info" with "age" subcategory
+- "What school does Tom go to?" -> relevant to "education" with "school" subcategory
+
+Analyze the query and identify potential categories that might contain relevant information using the exact category names above."""
+
+        search_results = self.llm.generate_response(
+            messages=[
+                {"role": "system", "content": prompt},
+                {"role": "user", "content": query},
+            ],
+            tools=_tools,
+        )
+
+        categories = []
+        try:
+            for tool_call in search_results["tool_calls"]:
+                if tool_call["name"] != "classify_query_categories":
+                    continue
+                for item in tool_call["arguments"]["categories"]:
+                    categories.append({
+                        "topic": item["topic"],
+                        "sub_topic": item["sub_topic"],
+                        "confidence": item["confidence"]
+                    })
+        except Exception as e:
+            logger.exception(f"Error in query classification: {e}")
+            
+        return categories
+
+    def _search_category_paths(self, user_id, agent_id, topic, sub_topic, limit):
+        """Search for specific category paths in the subgraph."""
+        agent_filter = ""
+        params = {"user_id": user_id, "topic": topic, "sub_topic": sub_topic, "limit": limit}
+        
+        if agent_id:
+            agent_filter = "AND user.agent_id = $agent_id AND topic.agent_id = $agent_id AND sub_topic.agent_id = $agent_id AND memo.agent_id = $agent_id"
+            params["agent_id"] = agent_id
+            
+        cypher = f"""
+        MATCH (user:Entity {{user_id: $user_id}})-[:HAS_TOPIC]->(topic:Category {{name: $topic}})
+        -[:HAS_SUB_TOPIC]->(sub_topic:Category {{name: $sub_topic}})
+        -[:HAS_MEMO]->(memo:Category)
+        WHERE 1=1 {agent_filter}
+        RETURN user.name AS source, 'HAS_TOPIC' AS relationship, topic.name AS destination
+        UNION
+        MATCH (user:Entity {{user_id: $user_id}})-[:HAS_TOPIC]->(topic:Category {{name: $topic}})
+        -[:HAS_SUB_TOPIC]->(sub_topic:Category {{name: $sub_topic}})
+        -[:HAS_MEMO]->(memo:Category)
+        WHERE 1=1 {agent_filter}
+        RETURN topic.name AS source, 'HAS_SUB_TOPIC' AS relationship, sub_topic.name AS destination
+        UNION
+        MATCH (user:Entity {{user_id: $user_id}})-[:HAS_TOPIC]->(topic:Category {{name: $topic}})
+        -[:HAS_SUB_TOPIC]->(sub_topic:Category {{name: $sub_topic}})
+        -[:HAS_MEMO]->(memo:Category)
+        WHERE 1=1 {agent_filter}
+        RETURN sub_topic.name AS source, 'HAS_MEMO' AS relationship, memo.name AS destination
+        LIMIT $limit
+        """
+        
+        results = self.graph.query(cypher, params=params)
+        return [dict(item) for item in results]
+
+    def _get_existing_user_categories(self, filters):
+        """Get existing user categories for context in extraction."""
+        user_id = filters["user_id"]
+        agent_id = filters.get("agent_id")
+        
+        agent_filter = ""
+        params = {"user_id": user_id}
+        if agent_id:
+            agent_filter = "AND user.agent_id = $agent_id AND topic.agent_id = $agent_id AND sub_topic.agent_id = $agent_id AND memo.agent_id = $agent_id"
+            params["agent_id"] = agent_id
+            
+        cypher = f"""
+        MATCH (user:Entity {{user_id: $user_id}})-[:HAS_TOPIC]->(topic:Category)
+        -[:HAS_SUB_TOPIC]->(sub_topic:Category)
+        -[:HAS_MEMO]->(memo:Category)
+        WHERE 1=1 {agent_filter}
+        RETURN topic.name AS topic, sub_topic.name AS sub_topic, memo.name AS memo
+        LIMIT 50
+        """
+        
+        results = self.graph.query(cypher, params=params)
+        
+        # Format as string for input
+        if not results:
+            return "No existing categories found."
+            
+        category_lines = []
+        for item in results:
+            category_lines.append(f"- {item['topic']}\t{item['sub_topic']}\t{item['memo']}")
+            
+        return "\n".join(category_lines)
+
+    def _add_to_memzero_category(self, user_id, agent_id, category_name, category_embedding):
+        """Adds a user-category relationship to the memzero_category index."""
+        agent_id_clause = ""
+        if agent_id:
+            agent_id_clause = ", agent_id: $agent_id"
+
+        # 确保用户节点作为Entity存在（应该已经从memzero逻辑中存在）
+        # 合并带有 :Category 标签的类目节点 (也带有 :Entity 标签以保持与其他节点的一致性)
+        # 在 memzero_category 中创建从用户到类目的关系
+        cypher = f"""
+        MERGE (user:Entity {{name: $user_id, user_id: $user_id{agent_id_clause}}})
+        ON CREATE SET user.created = timestamp()
+        MERGE (category:Category:Entity {{name: $category_name, user_id: $user_id{agent_id_clause}}})
+        ON CREATE SET category.created = timestamp(), category.embedding = $category_embedding
+        ON MATCH SET category.embedding = $category_embedding // 如果匹配到，更新嵌入
+        MERGE (user)-[r:HAS_CATEGORY]->(category)
+        ON CREATE SET r.created = timestamp()
+        RETURN user.name AS source, type(r) AS relationship, category.name AS target
+        """
+        params = {
+            "user_id": user_id,
+            "category_name": category_name,
+            "category_embedding": category_embedding,
+        }
+        if agent_id:
+            params["agent_id"] = agent_id
+        self.graph.query(cypher, params=params)
+        logger.debug(f"已为用户 '{user_id}' 在 memzero_category 中添加/更新 '{category_name}'")

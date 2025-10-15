@@ -1,0 +1,9 @@
+                MATCH (n:Entity {user_id: $user_id})
+                WHERE n.embedding IS NOT NULL
+                WITH n, $n_embedding as n_embedding, collect(n) AS nodes_to_compare
+                CALL node_similarity.cosine_pairwise("embedding", nodes_to_compare, nodes_to_compare)
+                YIELD node1, node2, similarity
+                WITH n, similarity
+                WHERE similarity >= $threshold
+                MATCH (n)-[r]->(m:Entity)
+                RETURN n.name AS source, id(n) AS source_id, type(r) AS relationship, id(r) AS relation_id, m.name AS destination, id(m) AS destination_id, similarity

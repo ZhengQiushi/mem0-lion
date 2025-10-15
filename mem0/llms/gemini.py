@@ -197,5 +197,7 @@ class GeminiLLM(LLMBase):
         response = self.client.models.generate_content(
             model=self.config.model, contents=contents, config=generation_config
         )
-
-        return self._parse_response(response, tools)
+        ret = self._parse_response(response, tools)
+        if ret == "":
+            print("????")
+        return ret

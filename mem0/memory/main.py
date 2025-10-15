@@ -703,7 +703,16 @@ class Memory(MemoryBase):
             graph_entities = future_graph_entities.result() if future_graph_entities else None
 
         if self.enable_graph:
-            return {"results": original_memories, "relations": graph_entities}
+            # 检查是否是新的双路召回格式
+            if isinstance(graph_entities, dict) and "entity_results" in graph_entities:
+                return {
+                    "results": original_memories, 
+                    "entity_relations": graph_entities.get("entity_results", []),
+                    "category_relations": graph_entities.get("category_results", [])
+                }
+            else:
+                # 保持向后兼容性
+                return {"results": original_memories, "relations": graph_entities}
 
         if self.api_version == "v1.0":
             warnings.warn(
