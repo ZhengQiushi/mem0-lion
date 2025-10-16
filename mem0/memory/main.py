@@ -651,6 +651,7 @@ class Memory(MemoryBase):
         limit: int = 100,
         filters: Optional[Dict[str, Any]] = None,
         threshold: Optional[float] = None,
+        top_k_subtopics: int = 5,
     ):
         """
         Searches for memories based on a query
@@ -662,6 +663,7 @@ class Memory(MemoryBase):
             limit (int, optional): Limit the number of results. Defaults to 100.
             filters (dict, optional): Filters to apply to the search. Defaults to None..
             threshold (float, optional): Minimum score for a memory to be included in the results. Defaults to None.
+            top_k_subtopics (int, optional): Number of top matching sub_topics to retrieve in category search. Defaults to 5.
 
         Returns:
             dict: A dictionary containing the search results, typically under a "results" key,
@@ -692,7 +694,7 @@ class Memory(MemoryBase):
         with concurrent.futures.ThreadPoolExecutor() as executor:
             future_memories = executor.submit(self._search_vector_store, query, effective_filters, limit, threshold)
             future_graph_entities = (
-                executor.submit(self.graph.search, query, effective_filters, limit) if self.enable_graph else None
+                executor.submit(self.graph.search, query, effective_filters, limit, top_k_subtopics) if self.enable_graph else None
             )
 
             concurrent.futures.wait(
@@ -708,7 +710,8 @@ class Memory(MemoryBase):
                 return {
                     "results": original_memories, 
                     "entity_relations": graph_entities.get("entity_results", []),
-                    "category_relations": graph_entities.get("category_results", [])
+                    "category_relations": graph_entities.get("category_results", []),
+                    "category_related_memories": graph_entities.get("category_related_memories", [])
                 }
             else:
                 # 保持向后兼容性
@@ -1529,6 +1532,7 @@ class AsyncMemory(MemoryBase):
         limit: int = 100,
         filters: Optional[Dict[str, Any]] = None,
         threshold: Optional[float] = None,
+        top_k_subtopics: int = 5,
     ):
         """
         Searches for memories based on a query
@@ -1540,6 +1544,7 @@ class AsyncMemory(MemoryBase):
             limit (int, optional): Limit the number of results. Defaults to 100.
             filters (dict, optional): Filters to apply to the search. Defaults to None.
             threshold (float, optional): Minimum score for a memory to be included in the results. Defaults to None.
+            top_k_subtopics (int, optional): Number of top matching sub_topics to retrieve in category search. Defaults to 5.
 
         Returns:
             dict: A dictionary containing the search results, typically under a "results" key,
@@ -1573,9 +1578,9 @@ class AsyncMemory(MemoryBase):
         graph_task = None
         if self.enable_graph:
             if hasattr(self.graph.search, "__await__"):  # Check if graph search is async
-                graph_task = asyncio.create_task(self.graph.search(query, effective_filters, limit))
+                graph_task = asyncio.create_task(self.graph.search(query, effective_filters, limit, top_k_subtopics))
             else:
-                graph_task = asyncio.create_task(asyncio.to_thread(self.graph.search, query, effective_filters, limit))
+                graph_task = asyncio.create_task(asyncio.to_thread(self.graph.search, query, effective_filters, limit, top_k_subtopics))
 
         if graph_task:
             original_memories, graph_entities = await asyncio.gather(vector_store_task, graph_task)
@@ -1584,7 +1589,17 @@ class AsyncMemory(MemoryBase):
             graph_entities = None
 
         if self.enable_graph:
-            return {"results": original_memories, "relations": graph_entities}
+            # 检查是否是新的双路召回格式
+            if isinstance(graph_entities, dict) and "entity_results" in graph_entities:
+                return {
+                    "results": original_memories, 
+                    "entity_relations": graph_entities.get("entity_results", []),
+                    "category_relations": graph_entities.get("category_results", []),
+                    "category_related_memories": graph_entities.get("category_related_memories", [])
+                }
+            else:
+                # 保持向后兼容性
+                return {"results": original_memories, "relations": graph_entities}
 
         if self.api_version == "v1.0":
             warnings.warn(

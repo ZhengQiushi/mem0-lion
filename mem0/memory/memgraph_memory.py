@@ -147,7 +147,7 @@ class MemoryGraph:
             "added_categories": added_categories
         }
 
-    def search(self, query, filters, limit=100):
+    def search(self, query, filters, limit=100, top_k_subtopics=5):
         """
         Search for memories and related graph data using dual-path retrieval.
 
@@ -155,21 +155,24 @@ class MemoryGraph:
             query (str): Query to search for.
             filters (dict): A dictionary containing filters to be applied during the search.
             limit (int): The maximum number of nodes and relationships to retrieve. Defaults to 100.
+            top_k_subtopics (int): Number of top matching sub_topics to retrieve in category search. Defaults to 5.
 
         Returns:
             dict: A dictionary containing:
                 - "entity_results": List of results from entity subgraph search.
-                - "category_results": List of results from category subgraph search.
+                - "category_results": List of user->topic->sub_topic relations (embedding ranked).
+                - "category_related_memories": List of sub_topic->MEMO relations.
         """
-        # Path 1: Category-aware retrieval (context-aware)
-        category_results = self._search_category_subgraph(query, filters, limit)
+        # Path 1: Category-aware retrieval (context-aware with embedding matching)
+        category_relations, category_memories = self._search_category_subgraph(query, filters, limit, top_k_subtopics)
         
         # Path 2: Traditional entity retrieval (embedding-based)
         entity_results = self._search_entity_subgraph(query, filters, limit)
         
         return {
             "entity_results": entity_results,
-            "category_results": category_results
+            "category_results": category_relations,
+            "category_related_memories": category_memories
         }
 
     def delete_all(self, filters):
@@ -844,33 +847,101 @@ class MemoryGraph:
         logger.debug(f"Added category hierarchy: {user_id} -> {topic} -> {sub_topic} -> {memo}")
         return result
 
-    def _search_category_subgraph(self, query, filters, limit=100):
-        """Search the category subgraph using context-aware retrieval."""
+    def _search_category_subgraph(self, query, filters, limit=100, top_k_subtopics=5):
+        """Search the category subgraph using context-aware retrieval with embedding matching.
+        
+        Args:
+            query: The search query
+            filters: User and agent filters
+            limit: Maximum number of final results to return
+            top_k_subtopics: Number of top matching sub_topics to retrieve (default: 5)
+            
+        Returns:
+            tuple: (category_relations, category_related_memories)
+                - category_relations: List of user->topic->sub_topic relations
+                - category_related_memories: List of sub_topic->MEMO relations
+        """
         # First, classify the query to identify relevant categories
         query_categories = self._classify_query_categories(query, filters)
         
         if not query_categories:
             logger.info("No relevant categories identified for query")
-            return []
+            return [], []
             
-        # Search for matching categories in the subgraph
-        results = []
+        # Get all user's sub_topics with their embeddings
         user_id = filters["user_id"]
         agent_id = filters.get("agent_id")
         
+        all_subtopics = self._get_all_user_subtopics(user_id, agent_id)
+        
+        if not all_subtopics:
+            logger.info("No sub_topics found for user")
+            return [], []
+        
+        # Extract category embeddings from query categories
+        category_texts = []
         for category in query_categories:
-            topic = category["topic"]
-            sub_topic = category["sub_topic"]
-            confidence = category["confidence"]
+            # Combine topic and sub_topic for better context
+            category_text = f"{category['topic']} {category['sub_topic']}"
+            category_texts.append(category_text)
+        
+        # Calculate embeddings for query categories
+        query_embeddings = [self.embedding_model.embed(text) for text in category_texts]
+        
+        # Calculate similarity between query categories and sub_topics
+        subtopic_scores = []
+        for subtopic in all_subtopics:
+            subtopic_name = subtopic['sub_topic']
+            subtopic_embedding = subtopic['embedding']
             
-            if confidence < 0.3:  # Skip low confidence categories
-                continue
-                
-            # Search for matching category paths
-            category_results = self._search_category_paths(user_id, agent_id, topic, sub_topic, limit)
-            results.extend(category_results)
+            # Find max similarity across all query categories
+            max_similarity = 0
+            for query_embedding in query_embeddings:
+                similarity = self._cosine_similarity(query_embedding, subtopic_embedding)
+                max_similarity = max(max_similarity, similarity)
             
-        return results[:limit]
+            subtopic_scores.append({
+                'topic': subtopic['topic'],
+                'sub_topic': subtopic_name,
+                'similarity': max_similarity
+            })
+        
+        # Sort by similarity and get top K
+        subtopic_scores.sort(key=lambda x: x['similarity'], reverse=True)
+        top_subtopics = subtopic_scores[:top_k_subtopics]
+        
+        logger.info(f"Top {len(top_subtopics)} sub_topics by similarity:")
+        for i, st in enumerate(top_subtopics):
+            logger.info(f"  {i+1}. {st['topic']} -> {st['sub_topic']} (similarity: {st['similarity']:.4f})")
+        
+        # Build category relations (only HAS_SUB_TOPIC) and memory relations (sub_topic -> memo)
+        category_relations = []
+        category_related_memories = []
+        
+        for subtopic_info in top_subtopics:
+            topic = subtopic_info['topic']
+            sub_topic = subtopic_info['sub_topic']
+            similarity = subtopic_info['similarity']
+            
+            # Get the path relations (user -> topic -> sub_topic -> memo)
+            path_relations = self._get_category_path_relations(user_id, agent_id, topic, sub_topic)
+            
+            # Separate into category relations (only HAS_SUB_TOPIC) and memo relations
+            for relation in path_relations:
+                if relation['relationship'] == 'HAS_MEMO':
+                    category_related_memories.append(relation)
+                elif relation['relationship'] == 'HAS_SUB_TOPIC':
+                    # Format: {"sub_topic": {...}, "similarity": ...}
+                    category_relations.append({
+                        "sub_topic": {
+                            "source": relation['source'],
+                            "relationship": relation['relationship'],
+                            "destination": relation['destination']
+                        },
+                        "similarity": round(similarity, 4)
+                    })
+        
+        return category_relations[:limit], category_related_memories[:limit]
 
     def _search_entity_subgraph(self, query, filters, limit=100):
         """Search the entity subgraph using traditional embedding-based retrieval."""
@@ -938,6 +1009,15 @@ Analyze the query and identify potential categories that might contain relevant 
                     })
         except Exception as e:
             logger.exception(f"Error in query classification: {e}")
+        
+        # 打印query和对应的categories
+        logger.info(f"Query: '{query}'")
+        if categories:
+            logger.info(f"Extracted {len(categories)} categories:")
+            for i, cat in enumerate(categories):
+                logger.info(f"  {i+1}. topic='{cat['topic']}', sub_topic='{cat['sub_topic']}', confidence={cat['confidence']}")
+        else:
+            logger.info("No categories extracted from query")
             
         return categories
 
@@ -973,6 +1053,72 @@ Analyze the query and identify potential categories that might contain relevant 
         
         results = self.graph.query(cypher, params=params)
         return [dict(item) for item in results]
+
+    def _get_all_user_subtopics(self, user_id, agent_id):
+        """Get all sub_topic nodes with their embeddings for a user."""
+        agent_filter = ""
+        params = {"user_id": user_id}
+        
+        if agent_id:
+            agent_filter = "AND topic.agent_id = $agent_id AND sub_topic.agent_id = $agent_id"
+            params["agent_id"] = agent_id
+        
+        cypher = f"""
+        MATCH (user:Entity {{user_id: $user_id}})-[:HAS_TOPIC]->(topic:Category)
+        -[:HAS_SUB_TOPIC]->(sub_topic:Category)
+        WHERE sub_topic.embedding IS NOT NULL {agent_filter}
+        RETURN DISTINCT topic.name AS topic, sub_topic.name AS sub_topic, sub_topic.embedding AS embedding
+        """
+        
+        results = self.graph.query(cypher, params=params)
+        return [dict(item) for item in results]
+    
+    def _get_category_path_relations(self, user_id, agent_id, topic, sub_topic):
+        """Get all path relations for a specific topic and sub_topic, including MEMOs.
+        
+        Returns list of relations in order: user->topic, topic->sub_topic, sub_topic->memo
+        """
+        agent_filter = ""
+        params = {"user_id": user_id, "topic": topic, "sub_topic": sub_topic}
+        
+        if agent_id:
+            agent_filter = "AND user.agent_id = $agent_id AND topic.agent_id = $agent_id AND sub_topic.agent_id = $agent_id AND memo.agent_id = $agent_id"
+            params["agent_id"] = agent_id
+        
+        cypher = f"""
+        MATCH (user:Entity {{user_id: $user_id}})-[:HAS_TOPIC]->(topic:Category {{name: $topic}})
+        -[:HAS_SUB_TOPIC]->(sub_topic:Category {{name: $sub_topic}})
+        -[:HAS_MEMO]->(memo:Category)
+        WHERE 1=1 {agent_filter}
+        RETURN user.name AS source, 'HAS_TOPIC' AS relationship, topic.name AS destination
+        UNION
+        MATCH (user:Entity {{user_id: $user_id}})-[:HAS_TOPIC]->(topic:Category {{name: $topic}})
+        -[:HAS_SUB_TOPIC]->(sub_topic:Category {{name: $sub_topic}})
+        -[:HAS_MEMO]->(memo:Category)
+        WHERE 1=1 {agent_filter}
+        RETURN topic.name AS source, 'HAS_SUB_TOPIC' AS relationship, sub_topic.name AS destination
+        UNION
+        MATCH (user:Entity {{user_id: $user_id}})-[:HAS_TOPIC]->(topic:Category {{name: $topic}})
+        -[:HAS_SUB_TOPIC]->(sub_topic:Category {{name: $sub_topic}})
+        -[:HAS_MEMO]->(memo:Category)
+        WHERE 1=1 {agent_filter}
+        RETURN sub_topic.name AS source, 'HAS_MEMO' AS relationship, memo.name AS destination
+        """
+        
+        results = self.graph.query(cypher, params=params)
+        return [dict(item) for item in results]
+    
+    def _cosine_similarity(self, vec1, vec2):
+        """Calculate cosine similarity between two vectors."""
+        import numpy as np
+        vec1 = np.array(vec1)
+        vec2 = np.array(vec2)
+        dot_product = np.dot(vec1, vec2)
+        norm_vec1 = np.linalg.norm(vec1)
+        norm_vec2 = np.linalg.norm(vec2)
+        if norm_vec1 == 0 or norm_vec2 == 0:
+            return 0.0
+        return dot_product / (norm_vec1 * norm_vec2)
 
     def _get_existing_user_categories(self, filters):
         """Get existing user categories for context in extraction."""
