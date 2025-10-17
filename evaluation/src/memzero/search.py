@@ -7,7 +7,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dotenv import load_dotenv
 from jinja2 import Template
 from openai import OpenAI
-from prompts import ANSWER_PROMPT, ANSWER_PROMPT_GRAPH
+from prompts import ANSWER_PROMPT, ANSWER_PROMPT_GRAPH, ANSWER_PROMPT_DUAL_RECALL
 from tqdm import tqdm
 
 from mem0 import MemoryClient
@@ -16,7 +16,7 @@ load_dotenv()
 
 
 class MemorySearch:
-    def __init__(self, output_path="results.json", top_k=10, filter_memories=False, is_graph=False):
+    def __init__(self, output_path="results.json", top_k=10, filter_memories=False, is_graph=False, use_dual_recall=False):
         self.mem0_client = MemoryClient(
             api_key=os.getenv("MEM0_API_KEY"),
             org_id=os.getenv("MEM0_ORGANIZATION_ID"),
@@ -28,8 +28,11 @@ class MemorySearch:
         self.output_path = output_path
         self.filter_memories = filter_memories
         self.is_graph = is_graph
+        self.use_dual_recall = use_dual_recall
 
-        if self.is_graph:
+        if self.use_dual_recall:
+            self.ANSWER_PROMPT = ANSWER_PROMPT_DUAL_RECALL
+        elif self.is_graph:
             self.ANSWER_PROMPT = ANSWER_PROMPT_GRAPH
         else:
             self.ANSWER_PROMPT = ANSWER_PROMPT
@@ -39,8 +42,8 @@ class MemorySearch:
         retries = 0
         while retries < max_retries:
             try:
-                if self.is_graph:
-                    print("Searching with graph")
+                if self.is_graph or self.use_dual_recall:
+                    print(f"Searching with graph (dual_recall={self.use_dual_recall})")
                     memories = self.mem0_client.search(
                         query,
                         user_id=user_id,
@@ -62,7 +65,8 @@ class MemorySearch:
                 time.sleep(retry_delay)
 
         end_time = time.time()
-        if not self.is_graph:
+        
+        if not self.is_graph and not self.use_dual_recall:
             semantic_memories = [
                 {
                     "memory": memory["memory"],
@@ -71,43 +75,76 @@ class MemorySearch:
                 }
                 for memory in memories
             ]
-            graph_memories = None
-        else:
-            semantic_memories = [
-                {
-                    "memory": memory["memory"],
-                    "timestamp": memory["metadata"]["timestamp"],
-                    "score": round(memory["score"], 2),
-                }
-                for memory in memories["results"]
+            return semantic_memories, None, None, None, end_time - start_time
+        
+        # For graph or dual recall mode
+        semantic_memories = [
+            {
+                "memory": memory["memory"],
+                "timestamp": memory["metadata"]["timestamp"],
+                "score": round(memory["score"], 2),
+            }
+            for memory in memories["results"]
+        ]
+        
+        if self.use_dual_recall:
+            # Dual recall mode: separate entity and category relations
+            entity_relations = [
+                {"source": relation["source"], "relationship": relation["relationship"], "target": relation["target"]}
+                for relation in memories.get("entity_relations", [])
             ]
+            category_relations = memories.get("category_relations", [])
+            category_memories = [
+                {"source": relation["source"], "relationship": relation["relationship"], "target": relation["destination"]}
+                for relation in memories.get("category_related_memories", [])
+            ]
+            return semantic_memories, entity_relations, category_relations, category_memories, end_time - start_time
+        else:
+            # Original graph mode: only entity relations
             graph_memories = [
                 {"source": relation["source"], "relationship": relation["relationship"], "target": relation["target"]}
                 for relation in memories["relations"]
             ]
-        return semantic_memories, graph_memories, end_time - start_time
+            return semantic_memories, graph_memories, None, None, end_time - start_time
 
     def answer_question(self, speaker_1_user_id, speaker_2_user_id, question, answer, category):
-        speaker_1_memories, speaker_1_graph_memories, speaker_1_memory_time = self.search_memory(
-            speaker_1_user_id, question
-        )
-        speaker_2_memories, speaker_2_graph_memories, speaker_2_memory_time = self.search_memory(
-            speaker_2_user_id, question
-        )
+        (speaker_1_memories, speaker_1_entity_relations, speaker_1_category_relations, 
+         speaker_1_category_memories, speaker_1_memory_time) = self.search_memory(speaker_1_user_id, question)
+        
+        (speaker_2_memories, speaker_2_entity_relations, speaker_2_category_relations, 
+         speaker_2_category_memories, speaker_2_memory_time) = self.search_memory(speaker_2_user_id, question)
 
         search_1_memory = [f"{item['timestamp']}: {item['memory']}" for item in speaker_1_memories]
         search_2_memory = [f"{item['timestamp']}: {item['memory']}" for item in speaker_2_memories]
 
         template = Template(self.ANSWER_PROMPT)
-        answer_prompt = template.render(
-            speaker_1_user_id=speaker_1_user_id.split("_")[0],
-            speaker_2_user_id=speaker_2_user_id.split("_")[0],
-            speaker_1_memories=json.dumps(search_1_memory, indent=4),
-            speaker_2_memories=json.dumps(search_2_memory, indent=4),
-            speaker_1_graph_memories=json.dumps(speaker_1_graph_memories, indent=4),
-            speaker_2_graph_memories=json.dumps(speaker_2_graph_memories, indent=4),
-            question=question,
-        )
+        
+        if self.use_dual_recall:
+            # Dual recall mode: use new prompt template
+            answer_prompt = template.render(
+                speaker_1_user_id=speaker_1_user_id.split("_")[0],
+                speaker_2_user_id=speaker_2_user_id.split("_")[0],
+                speaker_1_memories=json.dumps(search_1_memory, indent=4),
+                speaker_2_memories=json.dumps(search_2_memory, indent=4),
+                speaker_1_entity_relations=json.dumps(speaker_1_entity_relations, indent=4),
+                speaker_2_entity_relations=json.dumps(speaker_2_entity_relations, indent=4),
+                speaker_1_category_relations=json.dumps(speaker_1_category_relations, indent=4),
+                speaker_2_category_relations=json.dumps(speaker_2_category_relations, indent=4),
+                speaker_1_category_memories=json.dumps(speaker_1_category_memories, indent=4),
+                speaker_2_category_memories=json.dumps(speaker_2_category_memories, indent=4),
+                question=question,
+            )
+        else:
+            # Original mode: use old prompt template
+            answer_prompt = template.render(
+                speaker_1_user_id=speaker_1_user_id.split("_")[0],
+                speaker_2_user_id=speaker_2_user_id.split("_")[0],
+                speaker_1_memories=json.dumps(search_1_memory, indent=4),
+                speaker_2_memories=json.dumps(search_2_memory, indent=4),
+                speaker_1_graph_memories=json.dumps(speaker_1_entity_relations, indent=4),
+                speaker_2_graph_memories=json.dumps(speaker_2_entity_relations, indent=4),
+                question=question,
+            )
 
         t1 = time.time()
         response = self.openai_client.chat.completions.create(
@@ -115,14 +152,19 @@ class MemorySearch:
         )
         t2 = time.time()
         response_time = t2 - t1
+        
         return (
             response.choices[0].message.content,
             speaker_1_memories,
             speaker_2_memories,
             speaker_1_memory_time,
             speaker_2_memory_time,
-            speaker_1_graph_memories,
-            speaker_2_graph_memories,
+            speaker_1_entity_relations,
+            speaker_2_entity_relations,
+            speaker_1_category_relations,
+            speaker_2_category_relations,
+            speaker_1_category_memories,
+            speaker_2_category_memories,
             response_time,
         )
 
@@ -139,8 +181,12 @@ class MemorySearch:
             speaker_2_memories,
             speaker_1_memory_time,
             speaker_2_memory_time,
-            speaker_1_graph_memories,
-            speaker_2_graph_memories,
+            speaker_1_entity_relations,
+            speaker_2_entity_relations,
+            speaker_1_category_relations,
+            speaker_2_category_relations,
+            speaker_1_category_memories,
+            speaker_2_category_memories,
             response_time,
         ) = self.answer_question(speaker_a_user_id, speaker_b_user_id, question, answer, category)
 
@@ -157,10 +203,25 @@ class MemorySearch:
             "num_speaker_2_memories": len(speaker_2_memories),
             "speaker_1_memory_time": speaker_1_memory_time,
             "speaker_2_memory_time": speaker_2_memory_time,
-            "speaker_1_graph_memories": speaker_1_graph_memories,
-            "speaker_2_graph_memories": speaker_2_graph_memories,
             "response_time": response_time,
         }
+        
+        if self.use_dual_recall:
+            # Add dual recall specific fields
+            result.update({
+                "speaker_1_entity_relations": speaker_1_entity_relations,
+                "speaker_2_entity_relations": speaker_2_entity_relations,
+                "speaker_1_category_relations": speaker_1_category_relations,
+                "speaker_2_category_relations": speaker_2_category_relations,
+                "speaker_1_category_memories": speaker_1_category_memories,
+                "speaker_2_category_memories": speaker_2_category_memories,
+            })
+        else:
+            # Add original graph memories field for backward compatibility
+            result.update({
+                "speaker_1_graph_memories": speaker_1_entity_relations,
+                "speaker_2_graph_memories": speaker_2_entity_relations,
+            })
 
         # Save results after each question is processed
         with open(self.output_path, "w") as f:
