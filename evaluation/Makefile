@@ -1,5 +1,30 @@
 
 # Run the experiments
+
+# ============================================================================
+# 本地版本（使用本地Memory，不需要Mem0 API key）
+# ============================================================================
+run-mem0-local-add:
+	python run_experiments.py --technique_type mem0 --method add --use_local --is_graph
+
+run-mem0-local-search:
+	python run_experiments.py --technique_type mem0 --method search --use_local --output_folder results/ --top_k 30
+
+run-mem0-local-plus-search:
+	python run_experiments.py --technique_type mem0 --method search --use_local --is_graph --output_folder results/ --top_k 30
+
+run-mem0-local-dual-recall-search:
+	python run_experiments.py --technique_type mem0 --method search --use_local --use_dual_recall --output_folder results/ --top_k 30 --top_k_subtopics 5
+
+run-mem0-local-dual-recall-search-k3:
+	python run_experiments.py --technique_type mem0 --method search --use_local --use_dual_recall --output_folder results/ --top_k 30 --top_k_subtopics 3
+
+run-mem0-local-dual-recall-search-k10:
+	python run_experiments.py --technique_type mem0 --method search --use_local --use_dual_recall --output_folder results/ --top_k 30 --top_k_subtopics 10
+
+# ============================================================================
+# 云端版本（需要Mem0 API key）
+# ============================================================================
 run-mem0-add:
 	python run_experiments.py --technique_type mem0 --method add
 

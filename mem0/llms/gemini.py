@@ -1,4 +1,5 @@
 import os
+import logging
 from typing import Dict, List, Optional
 
 try:
@@ -10,6 +11,8 @@ except ImportError:
 from mem0.configs.llms.base import BaseLlmConfig
 from mem0.llms.base import LLMBase
 
+logger = logging.getLogger(__name__)
+
 
 class GeminiLLM(LLMBase):
     def __init__(self, config: Optional[BaseLlmConfig] = None):
@@ -20,6 +23,12 @@ class GeminiLLM(LLMBase):
 
         api_key = self.config.api_key or os.getenv("GOOGLE_API_KEY")
         self.client = genai.Client(api_key=api_key)
+        
+        # 初始化token统计
+        self.total_input_tokens = 0
+        self.total_output_tokens = 0
+        self.total_tokens = 0
+        self.call_count = 0
 
     def _parse_response(self, response, tools):
         """
@@ -150,6 +159,12 @@ class GeminiLLM(LLMBase):
         Returns:
             str: The generated response.
         """
+        
+        # 获取调用者信息
+        import inspect
+        caller_frame = inspect.currentframe().f_back
+        caller_name = caller_frame.f_code.co_name if caller_frame else "unknown"
+        caller_module = caller_frame.f_globals.get('__name__', 'unknown') if caller_frame else "unknown"
 
         # Extract system instruction and reformat messages
         system_instruction, contents = self._reformat_messages(messages)
@@ -197,5 +212,131 @@ class GeminiLLM(LLMBase):
         response = self.client.models.generate_content(
             model=self.config.model, contents=contents, config=generation_config
         )
+        
+        ret = self._parse_response(response, tools)
+        
+        # 提取并统计token使用信息（包含调用者信息和响应内容）
+        self._log_token_usage(response, caller_name, caller_module, ret, tools)
+        
+        if ret is None or ret == "":
+            # 打印状态码和错误代码
+            for i in range(len(response.candidates)):
+                print(f"Candidate {i}:")
+                print(f"  Status code: {response.candidates[i].finish_reason}")
+            raise ValueError("Empty response from Gemini API")
 
-        return self._parse_response(response, tools)
+        return ret
+    
+    def _log_token_usage(self, response, caller_name: str, caller_module: str, output_content, tools=None):
+        """
+        提取并记录token使用统计信息
+        
+        Args:
+            response: Gemini API响应对象
+            caller_name: 调用者函数名
+            caller_module: 调用者模块名
+            output_content: LLM的响应输出内容
+            tools: 使用的工具列表
+        """
+        try:
+            # 增加调用计数
+            self.call_count += 1
+            
+            # 从response中提取token使用信息
+            if hasattr(response, 'usage_metadata'):
+                usage = response.usage_metadata
+                
+                # 提取token数量
+                input_tokens = getattr(usage, 'prompt_token_count', 0)
+                output_tokens = getattr(usage, 'candidates_token_count', 0)
+                total = getattr(usage, 'total_token_count', 0)
+                
+                # 累加到总计
+                self.total_input_tokens += input_tokens
+                self.total_output_tokens += output_tokens
+                self.total_tokens += total
+                
+                # 确定调用类型
+                call_type = "Tool Calling" if tools else "Text Generation"
+                
+                # 格式化输出内容（截断过长的内容）
+                if isinstance(output_content, dict):
+                    # Tool calling响应
+                    if 'tool_calls' in output_content and output_content['tool_calls']:
+                        tool_names = [tc['name'] for tc in output_content['tool_calls']]
+                        output_preview = f"Tool调用: {', '.join(tool_names)}"
+                        if output_content.get('content'):
+                            output_preview += f" | 内容: {str(output_content['content'])[:100]}"
+                    else:
+                        output_preview = str(output_content)[:150]
+                elif isinstance(output_content, str):
+                    output_preview = output_content[:150]
+                    if len(output_content) > 150:
+                        output_preview += "..."
+                else:
+                    output_preview = str(output_content)[:150]
+                
+                # 打印详细信息到console
+                print("\n" + "="*80)
+                print(f"🔷 Gemini API调用 #{self.call_count}")
+                print("="*80)
+                print(f"📍 调用来源: {caller_module}.{caller_name}()")
+                print(f"🏷️  调用类型: {call_type}")
+                print(f"📥 输入tokens: {input_tokens:,}")
+                print(f"📤 输出tokens: {output_tokens:,}")
+                print(f"📊 本次合计: {total:,} tokens")
+                print(f"📈 累计总tokens: {self.total_tokens:,}")
+                print(f"💬 输出内容预览:")
+                print(f"   {output_preview}")
+                print("="*80 + "\n")
+                
+                # 记录到logger（更详细）
+                logger.info(f"🔷 Gemini API调用 #{self.call_count}")
+                logger.info(f"  📍 调用来源: {caller_module}.{caller_name}()")
+                logger.info(f"  🏷️  调用类型: {call_type}")
+                logger.info(f"  📥 输入tokens: {input_tokens:,}")
+                logger.info(f"  📤 输出tokens: {output_tokens:,}")
+                logger.info(f"  📊 本次总计: {total:,}")
+                logger.info(f"  📈 累计总输入: {self.total_input_tokens:,}")
+                logger.info(f"  📈 累计总输出: {self.total_output_tokens:,}")
+                logger.info(f"  📈 累计总tokens: {self.total_tokens:,}")
+                logger.info(f"  💬 输出内容: {output_content}")
+            else:
+                print(f"⚠️  调用#{self.call_count} ({caller_module}.{caller_name}): 响应中未找到usage_metadata")
+                logger.warning(f"⚠️  Gemini API响应中未找到usage_metadata，无法统计token")
+                
+        except Exception as e:
+            logger.error(f"❌ 统计token使用时出错: {e}")
+            import traceback
+            traceback.print_exc()
+    
+    def get_token_stats(self) -> Dict[str, int]:
+        """
+        获取token使用统计
+        
+        Returns:
+            dict: 包含token统计信息的字典
+        """
+        return {
+            "call_count": self.call_count,
+            "total_input_tokens": self.total_input_tokens,
+            "total_output_tokens": self.total_output_tokens,
+            "total_tokens": self.total_tokens,
+            "average_input_tokens": self.total_input_tokens // self.call_count if self.call_count > 0 else 0,
+            "average_output_tokens": self.total_output_tokens // self.call_count if self.call_count > 0 else 0,
+        }
+    
+    def print_token_summary(self):
+        """打印token使用总结"""
+        stats = self.get_token_stats()
+        print("\n" + "="*60)
+        print("📊 Gemini Token使用总结")
+        print("="*60)
+        print(f"🔢 总调用次数: {stats['call_count']:,}")
+        print(f"📥 总输入tokens: {stats['total_input_tokens']:,}")
+        print(f"📤 总输出tokens: {stats['total_output_tokens']:,}")
+        print(f"📊 总计tokens: {stats['total_tokens']:,}")
+        if stats['call_count'] > 0:
+            print(f"📊 平均输入tokens: {stats['average_input_tokens']:,}")
+            print(f"📊 平均输出tokens: {stats['average_output_tokens']:,}")
+        print("="*60 + "\n")
